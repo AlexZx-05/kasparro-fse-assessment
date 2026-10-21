@@ -139,7 +139,7 @@ class CreateEvaluationRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     version: Literal["v1", "v2"]
-    dataset_split: Literal["development", "check"] = "development"
+    dataset_split: Literal["development"] = "development"
 
 
 class EvaluationRunResponse(BaseModel):

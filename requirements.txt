@@ -2,7 +2,8 @@ fastapi
 uvicorn
 pydantic>=2.7,<3
 python-dotenv
-groq
+openai>=1.0,<3
+langfuse>=4.7,<6
 sqlalchemy
 psycopg2-binary
 pytest

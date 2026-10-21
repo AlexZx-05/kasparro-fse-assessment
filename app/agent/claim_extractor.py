@@ -64,10 +64,12 @@ def create_default_extractor(
     *,
     system_prompt: str | None = None,
 ) -> ClaimExtractor:
-    """Create a Groq-backed extractor with an optional frozen prompt version."""
-    from app.agent.groq_client import GroqClient
+    """Create an OpenRouter-backed extractor with an optional frozen prompt."""
+    from app.agent.openrouter_client import OpenRouterClient
     from app.agent.prompts import EXTRACTION_SYSTEM_PROMPT
 
     return ClaimExtractor(
-        GroqClient(extraction_system_prompt=system_prompt or EXTRACTION_SYSTEM_PROMPT)
+        OpenRouterClient(
+            extraction_system_prompt=system_prompt or EXTRACTION_SYSTEM_PROMPT
+        )
     )

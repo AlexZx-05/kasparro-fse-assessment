@@ -42,6 +42,107 @@ def ensure_run_destination(
     return directory
 
 
+def ensure_phase7_report_destination(path: Path, *, overwrite: bool) -> None:
+    """Reject an existing Phase 7 summary before starting a billable run."""
+    if path.exists() and not overwrite:
+        raise ReportExistsError(
+            f"Refusing to overwrite existing evaluation report {path}. "
+            "Use --overwrite only for an intentional replacement."
+        )
+
+
+def write_phase7_report(
+    *,
+    path: Path,
+    run_id: str | int,
+    version: str,
+    dataset_split: str,
+    timestamp: str,
+    model: str,
+    configuration: dict[str, object],
+    outcomes: list[dict[str, object]],
+    metrics: dict[str, object] | None,
+    runtime_seconds: float,
+    overwrite: bool = False,
+) -> Path:
+    """Write one actual run summary, using null metrics when gold is unavailable."""
+    ensure_phase7_report_destination(path, overwrite=overwrite)
+    successful_answers = sum(
+        outcome.get("status") == "success" for outcome in outcomes
+    )
+    payload: dict[str, object] = {
+        "run_id": run_id,
+        "version": version,
+        "dataset_split": dataset_split,
+        "timestamp": timestamp,
+        "model": model,
+        "answers_processed": len(outcomes),
+        "successful_answers": successful_answers,
+        "operational_failures": len(outcomes) - successful_answers,
+        "runtime_seconds": runtime_seconds,
+        "actual_cost": None,
+        "actual_cost_unavailable_reason": (
+            "The provider adapter does not expose billed cost; no estimate was made."
+        ),
+        "metrics": metrics,
+        "metrics_unavailable_reason": (
+            "No authorized final-check gold labels are available."
+            if metrics is None and dataset_split == "check"
+            else None
+        ),
+        "configuration": configuration,
+        "outcomes": outcomes,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_json(path, payload)
+    return path
+
+
+def export_phase7_development_report(
+    *,
+    reports_root: Path,
+    run_id: int,
+    version: str,
+    timestamp: str,
+    runtime_seconds: float,
+    output_path: Path,
+    overwrite: bool = False,
+) -> Path:
+    """Export a completed API run's actual saved predictions and metrics."""
+    run_directory = reports_root / "api_runs" / str(run_id) / version
+    metrics_payload = _read_json(run_directory / "development_metrics.json")
+    predictions_payload = _read_json(run_directory / "development_predictions.json")
+    run_metadata = metrics_payload.get("run")
+    outcomes = predictions_payload.get("outcomes")
+    metrics = metrics_payload.get("metrics")
+    if (
+        not isinstance(run_metadata, dict)
+        or run_metadata.get("version") != version
+        or run_metadata.get("split") != "development"
+        or not isinstance(run_metadata.get("model"), str)
+        or not isinstance(run_metadata.get("configuration"), dict)
+        or not isinstance(outcomes, list)
+        or not all(isinstance(outcome, dict) for outcome in outcomes)
+        or not isinstance(metrics, dict)
+    ):
+        raise ValueError(
+            f"Run {run_id} does not contain a valid completed development report."
+        )
+    return write_phase7_report(
+        path=output_path,
+        run_id=run_id,
+        version=version,
+        dataset_split="development",
+        timestamp=timestamp,
+        model=run_metadata["model"],
+        configuration=run_metadata["configuration"],
+        outcomes=outcomes,
+        metrics=metrics,
+        runtime_seconds=runtime_seconds,
+        overwrite=overwrite,
+    )
+
+
 def write_development_reports(
     *,
     reports_root: Path,
@@ -98,9 +199,14 @@ def write_development_reports(
     }
 
 
-def write_v1_v2_comparison(reports_root: Path) -> dict[str, Path]:
+def write_v1_v2_comparison(
+    reports_root: Path,
+    *,
+    v1_reports_root: Path | None = None,
+) -> dict[str, Path]:
     """Compare saved development reports without rerunning inference."""
-    v1 = _read_json(reports_root / "v1" / "development_metrics.json")
+    baseline_root = v1_reports_root or reports_root
+    v1 = _read_json(baseline_root / "v1" / "development_metrics.json")
     v2 = _read_json(reports_root / "v2" / "development_metrics.json")
     v1_ids = v1.get("scheduled_answer_ids")
     v2_ids = v2.get("scheduled_answer_ids")

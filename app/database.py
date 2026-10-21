@@ -6,7 +6,7 @@ from collections.abc import Generator
 from typing import Any
 
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Engine, URL, make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import get_settings
@@ -27,7 +27,10 @@ def get_database_url() -> str:
 def get_engine() -> Engine:
     global _engine
     if _engine is None:
-        _engine = create_engine(get_database_url(), pool_pre_ping=True, future=True)
+        database_url: URL = make_url(get_database_url())
+        if database_url.get_backend_name() == "postgresql":
+            database_url = database_url.set(drivername="postgresql+psycopg2")
+        _engine = create_engine(database_url, pool_pre_ping=True, future=True)
     return _engine
 
 
@@ -56,3 +59,10 @@ def validate_database_configuration() -> None:
     get_database_url()
     with get_engine().connect() as connection:
         connection.execute(text("SELECT 1"))
+
+
+def initialize_database() -> None:
+    """Create missing application tables without modifying existing tables."""
+    from app.db_models import Base
+
+    Base.metadata.create_all(bind=get_engine())

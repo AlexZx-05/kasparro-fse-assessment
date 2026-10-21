@@ -129,7 +129,7 @@ def execute_registered_tool(
 
 
 def serialize_brand_facts_result(result: BrandFactsResult) -> str:
-    """Serialize actual catalogue values for a Groq tool response."""
+    """Serialize actual catalogue values for a model tool response."""
     return result.model_dump_json()
 
 

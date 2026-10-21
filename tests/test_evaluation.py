@@ -1,4 +1,5 @@
 import csv
+import json
 from pathlib import Path
 
 import pytest
@@ -235,8 +236,8 @@ def test_coverage_keeps_failed_answers_and_their_gold_claims() -> None:
         status="error",
         predictions=(),
         duration_ms=2.0,
-        error_type="GroqTimeoutError",
-        error_message="Groq request timed out",
+        error_type="OpenRouterTimeoutError",
+        error_message="OpenRouter request timed out",
     )
     scored = score_exact_spans(
         [first, second],
@@ -298,6 +299,7 @@ def test_runner_saves_actual_fake_outcomes_without_passing_gold_to_processor(
 ) -> None:
     data_dir = _evaluation_data(tmp_path / "data")
     seen_answers: list[str] = []
+    progress: list[tuple[int, int, str]] = []
 
     def processor(answer: Answer) -> ClaimClassificationResult:
         seen_answers.append(answer.answer_id)
@@ -321,12 +323,133 @@ def test_runner_saves_actual_fake_outcomes_without_passing_gold_to_processor(
         data_dir=data_dir,
         reports_dir=tmp_path / "reports",
         answer_processor=processor,
+        progress_callback=lambda completed, total, outcome: progress.append(
+            (completed, total, outcome.status)
+        ),
     )
 
     assert seen_answers == ["A01"]
+    assert progress == [(1, 1, "success")]
     assert len(scored.matches) == 1
     assert metrics.joint_f1 == 1.0
     assert all(path.is_file() for path in paths.values())
+    phase7_report = paths["phase7_summary"]
+    report_payload = json.loads(phase7_report.read_text(encoding="utf-8"))
+    assert report_payload["run_id"]
+    assert report_payload["dataset_split"] == "development"
+    assert report_payload["answers_processed"] == 1
+    assert report_payload["successful_answers"] == 1
+    assert report_payload["metrics"]["joint"]["f1"] == 1.0
+    assert report_payload["actual_cost"] is None
+
+
+def test_final_check_runner_never_uses_gold_and_records_metrics_as_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.evaluation import runner as runner_module
+
+    data_dir = _evaluation_data(tmp_path / "data")
+    check_rows = [
+        {
+            "answer_id": f"A{number:02d}",
+            "split": "check",
+            "brand_id": "brand",
+            "question": "Question",
+            "ai_answer": f"Check fact {number}.",
+        }
+        for number in range(41, 51)
+    ]
+    _write_csv(
+        data_dir / "answers.csv",
+        ("answer_id", "split", "brand_id", "question", "ai_answer"),
+        check_rows,
+    )
+    (data_dir / "final_gold.csv").unlink(missing_ok=True)
+    monkeypatch.setattr(
+        runner_module,
+        "validate_development_gold",
+        lambda *_args, **_kwargs: pytest.fail("Final-check inference must not load gold"),
+    )
+
+    def processor(answer: Answer) -> ClaimClassificationResult:
+        return ClaimClassificationResult(answer_id=answer.answer_id, claims=())
+
+    outcomes, report_path = runner_module.run_final_check_evaluation(
+        version="v1",
+        data_dir=data_dir,
+        report_path=tmp_path / "reports" / "v1_final.json",
+        answer_processor=processor,
+        run_id="final-v1-test",
+    )
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert len(outcomes) == 10
+    assert payload["run_id"] == "final-v1-test"
+    assert payload["dataset_split"] == "check"
+    assert payload["answers_processed"] == 10
+    assert payload["successful_answers"] == 10
+    assert payload["operational_failures"] == 0
+    assert payload["metrics"] is None
+    assert payload["actual_cost"] is None
+    assert "development_gold.csv" not in payload["configuration"]["dataset_files"]
+
+
+def test_completed_api_run_can_be_exported_without_rerunning_inference(
+    tmp_path: Path,
+) -> None:
+    from app.evaluation.report import export_phase7_development_report
+
+    run_directory = tmp_path / "reports" / "api_runs" / "17" / "v1"
+    run_directory.mkdir(parents=True)
+    metadata = {
+        "version": "v1",
+        "split": "development",
+        "timestamp": "2026-10-21T12:00:00+00:00",
+        "model": "openai/gpt-oss-120b",
+        "configuration": {"extraction_prompt": {"sha256": "hash"}},
+    }
+    (run_directory / "development_metrics.json").write_text(
+        json.dumps({"run": metadata, "metrics": {"joint": {"f1": 0.5}}}),
+        encoding="utf-8",
+    )
+    (run_directory / "development_predictions.json").write_text(
+        json.dumps(
+            {
+                "run": metadata,
+                "outcomes": [
+                    {
+                        "answer_id": "A01",
+                        "status": "success",
+                        "predictions": [],
+                    },
+                    {
+                        "answer_id": "A02",
+                        "status": "error",
+                        "predictions": [],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    output = export_phase7_development_report(
+        reports_root=tmp_path / "reports",
+        run_id=17,
+        version="v1",
+        timestamp="2026-10-21T12:00:00+00:00",
+        runtime_seconds=21.5,
+        output_path=tmp_path / "reports" / "v1_development.json",
+    )
+    payload = json.loads(output.read_text(encoding="utf-8"))
+
+    assert payload["run_id"] == 17
+    assert payload["answers_processed"] == 2
+    assert payload["successful_answers"] == 1
+    assert payload["operational_failures"] == 1
+    assert payload["metrics"]["joint"]["f1"] == 0.5
+    assert payload["runtime_seconds"] == 21.5
 
 
 def test_frozen_version_prompts_are_available() -> None:

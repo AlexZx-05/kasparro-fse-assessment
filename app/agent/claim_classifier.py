@@ -1,4 +1,4 @@
-"""Catalogue-grounded claim classification with a bounded Groq tool loop."""
+"""Catalogue-grounded claim classification with a bounded model tool loop."""
 
 import json
 import logging
@@ -7,7 +7,8 @@ from typing import Protocol
 
 from pydantic import ValidationError
 
-from app.agent.groq_client import GroqClient
+from app.agent.openrouter_client import OpenRouterClient
+from app.langfuse import tracked_tool
 from app.agent.prompts import CLASSIFICATION_SYSTEM_PROMPT
 from app.agent.tools import (
     GET_BRAND_FACTS_TOOL,
@@ -61,7 +62,7 @@ class InvalidClassification(ClassificationError):
 
 
 class ClaimClassifier:
-    """Classify extracted claims using catalogue facts retrieved via Groq tools."""
+    """Classify extracted claims using catalogue facts retrieved via model tools."""
 
     def __init__(
         self,
@@ -154,11 +155,8 @@ class ClaimClassifier:
         available_facts: dict[str, object] | None = None
 
         for turn in range(1, self._max_model_turns + 1):
-            # Force the sole registered function on the first turn.  Groq can
-            # return HTTP 400 for tool_choice="required" when a model does not
-            # emit a valid call object; naming the only allowed tool removes
-            # that ambiguity.  Once facts are available, omit tool definitions
-            # so the final turn can only produce the required JSON response.
+            # Force the sole registered function on the first turn. Once facts
+            # are available, omit tools so the final turn returns classification JSON.
             tools = [GET_BRAND_FACTS_TOOL] if not called_brand_facts else None
             tool_choice = (
                 GET_BRAND_FACTS_REQUIRED_TOOL_CHOICE
@@ -184,7 +182,7 @@ class ClaimClassifier:
                 for tool_call in tool_calls:
                     call_id, tool_name, arguments_json = _parse_tool_call(tool_call)
                     if call_id in seen_call_ids:
-                        raise ToolCallError("Groq returned duplicate tool call IDs")
+                        raise ToolCallError("Model returned duplicate tool call IDs")
                     seen_call_ids.add(call_id)
                     if tool_name != "get_brand_facts":
                         raise ToolCallError(f"Unregistered tool requested: {tool_name!r}")
@@ -210,11 +208,25 @@ class ClaimClassifier:
                             "mapped brand"
                         )
                     try:
-                        result = execute_registered_tool(
-                            tool_name=tool_name,
-                            arguments_json=arguments_json,
-                            brand_facts_tool=self._brand_facts_tool,
-                        )
+                        with tracked_tool(
+                            name="get-brand-facts",
+                            metadata={
+                                "tool_name": tool_name,
+                                "brand_id": requested_brand,
+                            },
+                            input_data={"brand_id": requested_brand},
+                        ) as observation:
+                            result = execute_registered_tool(
+                                tool_name=tool_name,
+                                arguments_json=arguments_json,
+                                brand_facts_tool=self._brand_facts_tool,
+                            )
+                            observation.update(
+                                output={
+                                    "status": result.status,
+                                    "fact_count": len(result.facts),
+                                }
+                            )
                     except InvalidToolArguments as error:
                         raise ToolCallError(str(error)) from error
                     called_brand_facts = True
@@ -235,7 +247,7 @@ class ClaimClassifier:
                 continue
 
             if finish_reason == "tool_calls":
-                raise ToolCallError("Groq marked tool calls but returned none")
+                raise ToolCallError("Model marked tool calls but returned none")
             if not called_brand_facts or available_facts is None:
                 raise InvalidClassification(
                     "Model returned classifications without retrieving catalogue facts"
@@ -340,9 +352,9 @@ def create_default_classifier(
     system_prompt: str | None = None,
     data_dir: Path = DEFAULT_DATA_DIR,
 ) -> ClaimClassifier:
-    """Create a Groq classifier with an optional frozen prompt version."""
+    """Create an OpenRouter-backed classifier with a frozen prompt version."""
     return ClaimClassifier(
-        GroqClient(),
+        OpenRouterClient(),
         data_dir=data_dir,
         system_prompt=system_prompt or CLASSIFICATION_SYSTEM_PROMPT,
     )
@@ -357,11 +369,11 @@ def _get_field(value: object, field: str) -> object | None:
 def _get_assistant_message(response: object) -> tuple[object, str | None]:
     choices = _get_field(response, "choices")
     if not isinstance(choices, (list, tuple)) or not choices:
-        raise InvalidClassification("Groq returned an unexpected tool-call response")
+        raise InvalidClassification("Model returned an unexpected tool-call response")
     choice = choices[0]
     message = _get_field(choice, "message")
     if message is None:
-        raise InvalidClassification("Groq response did not contain an assistant message")
+        raise InvalidClassification("Model response did not contain an assistant message")
     finish_reason = _get_field(choice, "finish_reason")
     return message, finish_reason if isinstance(finish_reason, str) else None
 
@@ -377,7 +389,7 @@ def _parse_tool_call(tool_call: object) -> tuple[str, str, str]:
         or not isinstance(tool_name, str)
         or not isinstance(arguments, str)
     ):
-        raise ToolCallError("Groq returned a malformed tool call")
+        raise ToolCallError("Model returned a malformed tool call")
     return call_id, tool_name, arguments
 
 

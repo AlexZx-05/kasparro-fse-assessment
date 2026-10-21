@@ -543,13 +543,13 @@ def test_empty_extraction_returns_empty_without_model_call(
     assert client.calls == []
 
 
-def test_optional_live_groq_tool_calling() -> None:
+def test_optional_live_openrouter_tool_calling() -> None:
     import os
 
-    if os.getenv("RUN_GROQ_TOOL_INTEGRATION") != "1":
-        pytest.skip("Set RUN_GROQ_TOOL_INTEGRATION=1 to enable live tool integration")
-    if not os.getenv("GROQ_API_KEY"):
-        pytest.skip("GROQ_API_KEY is required for live Groq tool integration")
+    if os.getenv("RUN_OPENROUTER_TOOL_INTEGRATION") != "1":
+        pytest.skip("Set RUN_OPENROUTER_TOOL_INTEGRATION=1 to enable live tool integration")
+    if not os.getenv("OPENROUTER_API_KEY"):
+        pytest.skip("OPENROUTER_API_KEY is required for live OpenRouter tool integration")
 
     from app.agent.claim_classifier import create_default_classifier
     from app.data_loader import load_answers

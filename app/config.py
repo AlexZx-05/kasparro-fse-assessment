@@ -12,13 +12,9 @@ load_dotenv()
 
 @dataclass(frozen=True, slots=True)
 class Settings:
-    model_provider: str
     model_name: str
-    groq_api_key: str | None
-    groq_timeout_seconds: float
-    openai_api_key: str | None
-    gemini_api_key: str | None
-    anthropic_api_key: str | None
+    openrouter_api_key: str | None
+    model_timeout_seconds: float
     database_url: str | None
     langfuse_public_key: str | None
     langfuse_secret_key: str | None
@@ -27,22 +23,19 @@ class Settings:
 
 def get_settings() -> Settings:
     """Read settings without logging or otherwise exposing secret values."""
-    timeout_value = os.getenv("GROQ_TIMEOUT_SECONDS", "30")
+    timeout_value = os.getenv("MODEL_TIMEOUT_SECONDS", "15")
     try:
-        groq_timeout_seconds = float(timeout_value)
+        model_timeout_seconds = float(timeout_value)
     except ValueError as error:
-        raise ValueError("GROQ_TIMEOUT_SECONDS must be a positive number") from error
-    if not math.isfinite(groq_timeout_seconds) or groq_timeout_seconds <= 0:
-        raise ValueError("GROQ_TIMEOUT_SECONDS must be a positive number")
+        raise ValueError("MODEL_TIMEOUT_SECONDS must be a positive number") from error
+    if not math.isfinite(model_timeout_seconds) or model_timeout_seconds <= 0:
+        raise ValueError("MODEL_TIMEOUT_SECONDS must be a positive number")
+    model_timeout_seconds = min(model_timeout_seconds, 15.0)
 
     return Settings(
-        model_provider=os.getenv("MODEL_PROVIDER", "groq"),
-        model_name=os.getenv("MODEL_NAME", ""),
-        groq_api_key=os.getenv("GROQ_API_KEY"),
-        groq_timeout_seconds=groq_timeout_seconds,
-        openai_api_key=os.getenv("OPENAI_API_KEY"),
-        gemini_api_key=os.getenv("GEMINI_API_KEY"),
-        anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
+        model_name=os.getenv("MODEL_NAME", "openai/gpt-oss-120b"),
+        openrouter_api_key=os.getenv("OPENROUTER_API_KEY"),
+        model_timeout_seconds=model_timeout_seconds,
         database_url=os.getenv("DATABASE_URL"),
         langfuse_public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
         langfuse_secret_key=os.getenv("LANGFUSE_SECRET_KEY"),

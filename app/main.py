@@ -2,20 +2,42 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import logging
+from typing import AsyncIterator
 
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
+from sqlalchemy.exc import SQLAlchemyError
 
-from app.agent.claim_classifier import create_default_classifier
-from app.agent.claim_extractor import create_default_extractor
-from app.data_loader import DEFAULT_DATA_DIR, load_answers
-from app.database import validate_database_configuration
+from app.agent.claim_classifier import (
+    ClassificationError,
+    create_default_classifier,
+)
+from app.agent.claim_extractor import (
+    MalformedModelResponse,
+    create_default_extractor,
+)
+from app.agent.openrouter_client import (
+    OpenRouterAuthenticationError,
+    OpenRouterClientError,
+    OpenRouterRateLimitError,
+    OpenRouterTimeoutError,
+)
+from app.agent.validators import ClaimValidationError
+from app.config import get_settings
+from app.data_loader import DEFAULT_DATA_DIR, DatasetError, load_answers
+from app.database import initialize_database, validate_database_configuration
 from app.evaluation.error_analysis import analyse_errors
 from app.evaluation.runner import run_development_evaluation
+from app.evaluation.scorer import AnswerOutcome
+from app.evaluation.versions import AgentVersion
+from app.langfuse import tracked_trace
 from app.repositories import (
+    finalize_evaluation_run,
     create_run,
     get_run_with_results,
-    persist_run_result_set,
+    persist_answer_outcome,
     update_run,
 )
 from app.schemas import (
@@ -29,17 +51,36 @@ from app.schemas import (
     EvaluationRunResponse,
 )
 
-app = FastAPI(title="Kasparro FSE Assessment", version="0.2.0")
+logger = logging.getLogger(__name__)
 
 
-@app.on_event("startup")
 def _startup() -> None:
     try:
         validate_database_configuration()
+        initialize_database()
     except RuntimeError as error:
         raise RuntimeError(
             "DATABASE_URL is missing. Set it in the local .env file before starting the API."
         ) from error
+    except SQLAlchemyError as error:
+        logger.exception("Database startup validation or table initialization failed")
+        raise RuntimeError(
+            "Could not initialize the PostgreSQL database. Check the configured "
+            "database, network access, and database permissions."
+        ) from error
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    _startup()
+    yield
+
+
+app = FastAPI(
+    title="Kasparro FSE Assessment",
+    version="0.2.0",
+    lifespan=lifespan,
+)
 
 
 @app.get("/health")
@@ -48,30 +89,102 @@ def health() -> dict[str, str]:
 
 
 @app.post("/classify", response_model=ClassifyAnswerResponse)
-def classify_answer(
-    request: ClassifyAnswerRequest,
-) -> ClassifyAnswerResponse:
-    answers = load_answers()
+def classify_answer(request: ClassifyAnswerRequest) -> ClassifyAnswerResponse:
+    try:
+        answers = load_answers()
+    except DatasetError as error:
+        logger.exception("Could not load assessment answers")
+        raise HTTPException(
+            status_code=500,
+            detail="Assessment data could not be loaded.",
+        ) from error
+
     matches = [answer for answer in answers if answer.answer_id == request.answer_id]
     if len(matches) != 1:
-        raise HTTPException(status_code=404, detail=f"Unknown answer_id: {request.answer_id}")
+        raise HTTPException(status_code=404, detail="Unknown answer_id.")
     answer = matches[0]
     if request.brand_id is not None and request.brand_id != answer.brand_id:
         raise HTTPException(
             status_code=400,
-            detail=f"brand_id {request.brand_id!r} does not match the assessment record for answer {request.answer_id!r}",
+            detail="brand_id does not match the assessment record for this answer_id.",
         )
+    if request.ai_answer != answer.ai_answer:
+        raise HTTPException(
+            status_code=400,
+            detail="ai_answer must exactly match the assessment record for this answer_id.",
+        )
+
     try:
-        extraction = create_default_extractor().extract(answer.answer_id, request.ai_answer)
-        classification = create_default_classifier().classify(
+        with tracked_trace(
+            name="classify-answer",
+            metadata={
+                "answer_id": answer.answer_id,
+                "dataset_split": answer.split,
+                "brand_id": answer.brand_id,
+                "agent_version": "default",
+                "model": get_settings().model_name,
+            },
+        ):
+            extraction = create_default_extractor().extract(
+                answer.answer_id,
+                request.ai_answer,
+            )
+            classification = create_default_classifier().classify(
+                answer.answer_id,
+                request.ai_answer,
+                extraction,
+            )
+    except OpenRouterTimeoutError as error:
+        logger.warning("Classification timed out for answer %s", answer.answer_id)
+        raise HTTPException(
+            status_code=504,
+            detail="The model provider timed out while classifying this answer.",
+        ) from error
+    except OpenRouterAuthenticationError as error:
+        logger.error(
+            "OpenRouter rejected credentials or access for classification of answer %s",
             answer.answer_id,
-            request.ai_answer,
-            extraction,
         )
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "OpenRouter rejected the configured credentials or model access. "
+                "Verify OPENROUTER_API_KEY and confirm the configured model is "
+                "available to this account. Do not share the key."
+            ),
+        ) from error
+    except OpenRouterRateLimitError as error:
+        logger.warning(
+            "OpenRouter rate limit or quota blocked classification for answer %s",
+            answer.answer_id,
+        )
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "OpenRouter rate limit or quota was exceeded. Check the account "
+                "limits and usage, then retry after the limit resets."
+            ),
+        ) from error
+    except (
+        OpenRouterClientError,
+        ClassificationError,
+        MalformedModelResponse,
+        ClaimValidationError,
+    ) as error:
+        logger.warning(
+            "Provider or classification validation failed for answer %s (%s)",
+            answer.answer_id,
+            type(error).__name__,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="The model provider returned an unusable classification response.",
+        ) from error
     except Exception as error:
+        logger.exception("Classification failed for answer %s", answer.answer_id)
         raise HTTPException(
             status_code=500,
-            detail=f"Classification failed: {type(error).__name__}: {error}",
+            detail="Classification failed. Check the server logs for details.",
         ) from error
 
     claims = [
@@ -88,57 +201,130 @@ def classify_answer(
     return ClassifyAnswerResponse(answer_id=answer.answer_id, claims=claims)
 
 
-@app.post("/evaluation-runs", response_model=EvaluationRunResponse)
-def create_evaluation_run(request: CreateEvaluationRunRequest) -> EvaluationRunResponse:
-    run = create_run(request.version, request.dataset_split)
+@app.post(
+    "/evaluation-runs",
+    response_model=EvaluationRunResponse,
+    status_code=202,
+)
+def create_evaluation_run(
+    request: CreateEvaluationRunRequest,
+    background_tasks: BackgroundTasks,
+) -> EvaluationRunResponse:
     try:
-        scored, metrics, _ = run_development_evaluation(
-            version=request.version,
-            data_dir=DEFAULT_DATA_DIR,
-            reports_dir=DEFAULT_DATA_DIR.parent / "reports",
-            overwrite=False,
-        )
-        analysis = analyse_errors(scored)
-        persist_run_result_set(
-            run.id,
-            outcomes=list(scored.outcomes),
-            metrics=metrics.as_dict(),
-            error_summary=analysis,
-        )
-        update_run(
-            run.id,
-            status="completed",
-            total_answers=len(scored.outcomes),
-            successful_answers=sum(1 for outcome in scored.outcomes if outcome.status == "success"),
-            failed_answers=sum(1 for outcome in scored.outcomes if outcome.status != "success"),
-            metrics_json=metrics.as_dict(),
-            error_summary=analysis,
-            completed_at=datetime.now(timezone.utc),
-        )
-        return EvaluationRunResponse(
-            run_id=run.id,
-            version=request.version,
-            dataset_split=request.dataset_split,
-            status="completed",
-        )
-    except Exception as error:
-        update_run(
-            run.id,
-            status="failed",
-            error_summary={"error_type": type(error).__name__, "error_message": str(error)},
-            completed_at=datetime.now(timezone.utc),
-        )
+        run = create_run(request.version, request.dataset_split)
+    except SQLAlchemyError as error:
+        logger.exception("Could not create evaluation run record")
         raise HTTPException(
-            status_code=500,
-            detail=f"Evaluation run failed: {type(error).__name__}: {error}",
+            status_code=503,
+            detail="Could not create the evaluation run in the database. "
+            "Check server logs for details.",
         ) from error
 
+    background_tasks.add_task(
+        _execute_evaluation_run,
+        run.id,
+        request.version,
+        request.dataset_split,
+    )
+    return EvaluationRunResponse(
+        run_id=run.id,
+        version=request.version,
+        dataset_split=request.dataset_split,
+        status="running",
+    )
 
-@app.get("/evaluation-runs/{run_id}", response_model=EvaluationRunDetailResponse)
+
+def _execute_evaluation_run(
+    run_id: int,
+    version: AgentVersion,
+    dataset_split: str,
+) -> None:
+    try:
+        if dataset_split != "development":
+            raise ValueError("Only the development split is available in this phase.")
+        answers = load_answers(DEFAULT_DATA_DIR)
+        total_answers = sum(answer.split == dataset_split for answer in answers)
+        updated = update_run(
+            run_id,
+            status="running",
+            total_answers=total_answers,
+            successful_answers=0,
+            failed_answers=0,
+        )
+        if updated is None:
+            raise RuntimeError("Evaluation run record disappeared before execution.")
+
+        def record_progress(
+            completed_count: int,
+            answer_count: int,
+            outcome: AnswerOutcome,
+        ) -> None:
+            updated_run = persist_answer_outcome(run_id, outcome)
+            if updated_run is None:
+                raise RuntimeError(
+                    f"Evaluation run record disappeared after answer {completed_count}."
+                )
+            logger.info(
+                "Evaluation run %s processed answer %s/%s (%s): %s",
+                run_id,
+                completed_count,
+                answer_count,
+                outcome.answer_id,
+                outcome.status,
+            )
+
+        reports_root = DEFAULT_DATA_DIR.parent / "reports"
+        scored, metrics, _ = run_development_evaluation(
+            version=version,
+            data_dir=DEFAULT_DATA_DIR,
+            reports_dir=reports_root / "api_runs" / str(run_id),
+            baseline_reports_dir=reports_root,
+            overwrite=False,
+            progress_callback=record_progress,
+            run_id=run_id,
+            phase7_report_path=reports_root / f"{version}_development.json",
+        )
+        persisted = finalize_evaluation_run(
+            run_id,
+            metrics=metrics.as_dict(),
+            error_summary=analyse_errors(scored),
+            completed_at=datetime.now(timezone.utc),
+        )
+        if persisted is None:
+            raise RuntimeError("Evaluation run record disappeared before persistence.")
+    except Exception as error:
+        logger.exception("Evaluation run %s failed", run_id)
+        try:
+            updated = update_run(
+                run_id,
+                status="failed",
+                error_summary={
+                    "error_type": type(error).__name__,
+                    "error_message": "Evaluation execution failed; inspect server logs.",
+                },
+                completed_at=datetime.now(timezone.utc),
+            )
+            if updated is None:
+                logger.error("Could not find evaluation run %s to mark as failed", run_id)
+        except SQLAlchemyError:
+            logger.exception("Could not persist failed status for run %s", run_id)
+
+
+@app.get(
+    "/evaluation-runs/{run_id}",
+    response_model=EvaluationRunDetailResponse,
+)
 def get_evaluation_run(run_id: int) -> EvaluationRunDetailResponse:
-    run, answer_results, claim_results = get_run_with_results(run_id)
+    try:
+        run, answer_results, claim_results = get_run_with_results(run_id)
+    except SQLAlchemyError as error:
+        logger.exception("Could not retrieve evaluation run %s", run_id)
+        raise HTTPException(
+            status_code=503,
+            detail="Could not retrieve the evaluation run from the database.",
+        ) from error
     if run is None:
-        raise HTTPException(status_code=404, detail=f"Unknown evaluation run: {run_id}")
+        raise HTTPException(status_code=404, detail="Unknown evaluation run.")
 
     answer_items = [
         AnswerResultResponse(

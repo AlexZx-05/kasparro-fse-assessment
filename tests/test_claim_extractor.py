@@ -8,14 +8,14 @@ from app.agent.claim_extractor import (
     ClaimExtractor,
     MalformedModelResponse,
 )
-from app.agent.groq_client import (
-    GroqAuthenticationError,
-    GroqClient,
-    GroqConfigurationError,
-    GroqModelUnavailableError,
-    GroqProviderError,
-    GroqRateLimitError,
-    GroqTimeoutError,
+from app.agent.openrouter_client import (
+    OpenRouterAuthenticationError,
+    OpenRouterClient,
+    OpenRouterConfigurationError,
+    OpenRouterModelUnavailableError,
+    OpenRouterProviderError,
+    OpenRouterRateLimitError,
+    OpenRouterTimeoutError,
 )
 from app.agent.validators import ClaimValidationError, validate_claim_span
 from app.config import get_settings
@@ -205,24 +205,22 @@ def test_malformed_model_output_raises_clear_error() -> None:
         extractor.extract("A12", "A factual sentence.")
 
 
-def test_missing_groq_api_key_raises_configuration_error() -> None:
+def test_missing_openrouter_api_key_raises_configuration_error() -> None:
     settings = replace(
         get_settings(),
-        model_provider="groq",
         model_name="test-model",
-        groq_api_key=None,
+        openrouter_api_key=None,
     )
 
-    with pytest.raises(GroqConfigurationError, match="GROQ_API_KEY"):
-        GroqClient(settings)
+    with pytest.raises(OpenRouterConfigurationError, match="OPENROUTER_API_KEY"):
+        OpenRouterClient(settings)
 
 
 def _settings_with_key():
     return replace(
         get_settings(),
-        model_provider="groq",
         model_name="test-model",
-        groq_api_key="test-secret-never-log",
+        openrouter_api_key="test-secret-never-log",
     )
 
 
@@ -238,48 +236,48 @@ def _sdk_client_that_raises(error: Exception):
 
 
 def test_provider_timeout_is_sanitized(monkeypatch: pytest.MonkeyPatch) -> None:
-    import app.agent.groq_client as groq_module
+    import app.agent.openrouter_client as openrouter_module
 
     class FakeTimeout(Exception):
         pass
 
-    monkeypatch.setattr(groq_module, "APITimeoutError", FakeTimeout)
-    client = GroqClient(
+    monkeypatch.setattr(openrouter_module, "APITimeoutError", FakeTimeout)
+    client = OpenRouterClient(
         _settings_with_key(),
         sdk_client=_sdk_client_that_raises(FakeTimeout("test-secret-never-log")),
     )
 
-    with pytest.raises(GroqTimeoutError) as error:
+    with pytest.raises(OpenRouterTimeoutError) as error:
         client.complete("prompt")
 
     assert "test-secret-never-log" not in str(error.value)
 
 
 def test_provider_network_error_is_sanitized(monkeypatch: pytest.MonkeyPatch) -> None:
-    import app.agent.groq_client as groq_module
+    import app.agent.openrouter_client as openrouter_module
 
     class FakeConnectionError(Exception):
         pass
 
-    monkeypatch.setattr(groq_module, "APIConnectionError", FakeConnectionError)
-    client = GroqClient(
+    monkeypatch.setattr(openrouter_module, "APIConnectionError", FakeConnectionError)
+    client = OpenRouterClient(
         _settings_with_key(),
         sdk_client=_sdk_client_that_raises(
             FakeConnectionError("test-secret-never-log")
         ),
     )
 
-    with pytest.raises(GroqProviderError, match="Could not connect"):
+    with pytest.raises(OpenRouterProviderError, match="Could not connect"):
         client.complete("prompt")
 
 
 @pytest.mark.parametrize(
     ("status_code", "expected_error"),
     [
-        (401, GroqAuthenticationError),
-        (404, GroqModelUnavailableError),
-        (429, GroqRateLimitError),
-        (500, GroqProviderError),
+        (401, OpenRouterAuthenticationError),
+        (404, OpenRouterModelUnavailableError),
+        (429, OpenRouterRateLimitError),
+        (500, OpenRouterProviderError),
     ],
 )
 def test_provider_api_errors_are_sanitized(
@@ -287,15 +285,15 @@ def test_provider_api_errors_are_sanitized(
     status_code: int,
     expected_error: type[Exception],
 ) -> None:
-    import app.agent.groq_client as groq_module
+    import app.agent.openrouter_client as openrouter_module
 
     class FakeStatusError(Exception):
         def __init__(self, status: int) -> None:
             super().__init__("test-secret-never-log")
             self.status_code = status
 
-    monkeypatch.setattr(groq_module, "APIStatusError", FakeStatusError)
-    client = GroqClient(
+    monkeypatch.setattr(openrouter_module, "APIStatusError", FakeStatusError)
+    client = OpenRouterClient(
         _settings_with_key(),
         sdk_client=_sdk_client_that_raises(FakeStatusError(status_code)),
     )
@@ -306,23 +304,13 @@ def test_provider_api_errors_are_sanitized(
     assert "test-secret-never-log" not in str(error.value)
 
 
-def test_provider_does_not_fallback_to_another_provider() -> None:
-    settings = replace(
-        _settings_with_key(),
-        model_provider="openai",
-    )
-
-    with pytest.raises(GroqConfigurationError, match="fallback is disabled"):
-        GroqClient(settings)
-
-
-def test_optional_live_groq_integration() -> None:
+def test_optional_live_openrouter_integration() -> None:
     import os
 
-    if os.getenv("RUN_GROQ_INTEGRATION") != "1":
-        pytest.skip("Set RUN_GROQ_INTEGRATION=1 to enable the live Groq test")
-    if not os.getenv("GROQ_API_KEY"):
-        pytest.skip("GROQ_API_KEY is required for the live Groq test")
+    if os.getenv("RUN_OPENROUTER_INTEGRATION") != "1":
+        pytest.skip("Set RUN_OPENROUTER_INTEGRATION=1 to enable the live test")
+    if not os.getenv("OPENROUTER_API_KEY"):
+        pytest.skip("OPENROUTER_API_KEY is required for the live test")
 
     from app.agent.claim_extractor import create_default_extractor
 

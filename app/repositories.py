@@ -7,6 +7,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.data_loader import VALID_LABELS
 from app.db_models import AnswerResult, ClaimResult, Run
 from app.database import get_session_factory
 
@@ -142,12 +143,93 @@ def get_run_with_results(run_id: int) -> tuple[Run | None, list[AnswerResult], l
         session.close()
 
 
+def persist_answer_outcome(run_id: int, outcome: Any) -> Run | None:
+    """Persist one completed answer and update run counters atomically."""
+    session = get_session_factory()()
+    try:
+        run = session.get(Run, run_id)
+        if run is None:
+            return None
+
+        answer_result = AnswerResult(
+            run_id=run.id,
+            answer_id=outcome.answer_id,
+            status=outcome.status,
+            predicted_claim_count=len(outcome.predictions),
+            error_message=(
+                None
+                if outcome.status == "success"
+                else f"{getattr(outcome, 'error_type', 'InferenceError')}: "
+                "inference failed; inspect the evaluation report."
+            ),
+        )
+        session.add(answer_result)
+        session.flush()
+        for prediction in outcome.predictions:
+            if prediction.label not in VALID_LABELS:
+                raise ValueError(
+                    f"Prediction {prediction.claim_id!r} has an invalid label"
+                )
+            session.add(
+                ClaimResult(
+                    answer_result_id=answer_result.id,
+                    claim_id=prediction.claim_id,
+                    start_char=prediction.start_char,
+                    end_char=prediction.end_char,
+                    claim_text=prediction.quote,
+                    label=prediction.label,
+                    fact_ids=list(prediction.fact_ids),
+                )
+            )
+
+        if outcome.status == "success":
+            run.successful_answers += 1
+        else:
+            run.failed_answers += 1
+        session.commit()
+        session.refresh(run)
+        return run
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def finalize_evaluation_run(
+    run_id: int,
+    *,
+    metrics: dict[str, Any],
+    error_summary: dict[str, Any],
+    completed_at: Any,
+) -> Run | None:
+    """Set terminal run state after all per-answer outcomes have been saved."""
+    session = get_session_factory()()
+    try:
+        run = session.get(Run, run_id)
+        if run is None:
+            return None
+        run.status = "partial" if run.failed_answers else "completed"
+        run.metrics_json = metrics
+        run.error_summary = error_summary
+        run.completed_at = completed_at
+        session.commit()
+        session.refresh(run)
+        return run
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
 def persist_run_result_set(
     run_id: int,
     *,
     outcomes: list[Any],
     metrics: dict[str, Any] | None = None,
     error_summary: dict[str, Any] | None = None,
+    completed_at: Any | None = None,
 ) -> Run | None:
     session = get_session_factory()()
     try:
@@ -160,11 +242,20 @@ def persist_run_result_set(
                 answer_id=outcome.answer_id,
                 status=outcome.status,
                 predicted_claim_count=len(outcome.predictions),
-                error_message=getattr(outcome, "error_message", None),
+                error_message=(
+                    None
+                    if outcome.status == "success"
+                    else f"{getattr(outcome, 'error_type', 'InferenceError')}: "
+                    "inference failed; inspect the evaluation report."
+                ),
             )
             session.add(answer_result)
             session.flush()
             for prediction in outcome.predictions:
+                if prediction.label not in VALID_LABELS:
+                    raise ValueError(
+                        f"Prediction {prediction.claim_id!r} has an invalid label"
+                    )
                 session.add(
                     ClaimResult(
                         answer_result_id=answer_result.id,
@@ -172,7 +263,7 @@ def persist_run_result_set(
                         start_char=prediction.start_char,
                         end_char=prediction.end_char,
                         claim_text=prediction.quote,
-                        label=prediction.label or "unknown",
+                        label=prediction.label,
                         fact_ids=list(prediction.fact_ids),
                     )
                 )
@@ -183,9 +274,17 @@ def persist_run_result_set(
             run.metrics_json = metrics
         if error_summary is not None:
             run.error_summary = error_summary
-        run.status = "completed" if metrics is not None else "partial"
+        if any(outcome.status != "success" for outcome in outcomes) or metrics is None:
+            run.status = "partial"
+        else:
+            run.status = "completed"
+        if completed_at is not None:
+            run.completed_at = completed_at
         session.commit()
         session.refresh(run)
         return run
+    except Exception:
+        session.rollback()
+        raise
     finally:
         session.close()

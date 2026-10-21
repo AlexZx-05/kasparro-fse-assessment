@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from sqlalchemy.orm import DeclarativeBase
@@ -16,6 +24,20 @@ class Base(DeclarativeBase):
 
 class Run(Base):
     __tablename__ = "runs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'running', 'completed', 'failed', 'partial')",
+            name="ck_runs_status",
+        ),
+        CheckConstraint(
+            "dataset_split = 'development'",
+            name="ck_runs_dataset_split",
+        ),
+        CheckConstraint(
+            "total_answers >= 0 AND successful_answers >= 0 AND failed_answers >= 0",
+            name="ck_runs_answer_counts_nonnegative",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     version: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -42,6 +64,11 @@ class AnswerResult(Base):
     __tablename__ = "answer_results"
     __table_args__ = (
         UniqueConstraint("run_id", "answer_id", name="uq_answer_result_run_answer"),
+        CheckConstraint(
+            "status IN ('success', 'error')",
+            name="ck_answer_results_status",
+        ),
+        CheckConstraint("predicted_claim_count >= 0", name="ck_answer_claim_count"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
@@ -64,6 +91,11 @@ class ClaimResult(Base):
     __tablename__ = "claim_results"
     __table_args__ = (
         UniqueConstraint("answer_result_id", "claim_id", name="uq_claim_result_answer_claim"),
+        CheckConstraint(
+            "label IN ('supported', 'contradicted', 'unknown')",
+            name="ck_claim_results_label",
+        ),
+        CheckConstraint("start_char >= 0 AND end_char > start_char", name="ck_claim_span"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
@@ -81,4 +113,3 @@ class ClaimResult(Base):
     )
 
     answer_result: Mapped[AnswerResult] = relationship(back_populates="claim_results")
-

@@ -1,5 +1,7 @@
 # Environment file
-# .env
+.env
+.env.*
+!.env.example
 
 # Python virtual environments
 .venv/
@@ -16,6 +18,10 @@ htmlcov/
 # Generated reports
 reports/*
 !reports/.gitkeep
+!reports/v1_development.json
+!reports/v2_development.json
+!reports/v1_final.json
+!reports/v2_final.json
 
 # Temporary files
 *.tmp
