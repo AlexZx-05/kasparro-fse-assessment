@@ -1,5 +1,78 @@
 # Kasparro FSE Assessment — AI Claim Extraction and Classification
 
+## Quick start (Windows / Git Bash)
+
+Open a terminal in the project folder and run:
+
+```bash
+python -m venv .venv
+source .venv/Scripts/activate
+python -m pip install -r requirements.txt
+cp .env.example .env
+notepad .env
+```
+
+In `.env`, add your OpenRouter API key and PostgreSQL connection URL:
+
+```dotenv
+OPENROUTER_API_KEY=your_openrouter_key
+DATABASE_URL=your_postgresql_connection_url
+```
+
+Keep `.env` private; never paste its contents into chat or commit it to Git.
+Langfuse settings are optional. The provided CSV files should be in `data/`.
+Check the data and tests:
+
+```bash
+python -m app.data_loader
+python -m pytest -q
+```
+
+Start the API and leave this terminal open:
+
+```bash
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+When the terminal says `Application startup complete`, open
+<http://127.0.0.1:8000/docs> for the interactive API documentation, or visit
+<http://127.0.0.1:8000/health> to check that the API is responding. Press
+Ctrl+C in the server terminal to stop it.
+
+To run a development evaluation, use `POST /evaluation-runs` in `/docs` with
+`{"version":"v1","dataset_split":"development"}`. The response gives you a
+numeric `run_id`. Check its progress using that number, not the text
+`NEW_RUN_ID`:
+
+```bash
+RUN_ID=1
+curl "http://127.0.0.1:8000/evaluation-runs/${RUN_ID}"
+```
+
+Replace `1` with the ID returned by your request. A run is complete when its
+status is `completed`, `partial`, or `failed`. Keep Uvicorn running during the
+evaluation; these background jobs are not resumed after a server restart.
+
+## How this project works
+
+The project follows a simple evidence-first workflow:
+
+1. It loads the assessment answers and product catalogue from CSV files.
+2. The model identifies factual sentences. The application checks that each
+   sentence is an exact part of the original answer and calculates its Unicode
+   character offsets itself.
+3. For classification, the model must call the registered `get_brand_facts`
+   tool. The tool returns catalogue records for the answer's brand only.
+   Classification is accepted only when labels and cited fact IDs pass
+   application validation. A claim can be `supported`, `contradicted`, or
+   `unknown`; missing evidence is not treated as contradiction.
+4. During development evaluation, the evaluator compares predictions to the
+   development gold data after inference and calculates exact-span and
+   classification metrics. Gold labels are not sent to the model.
+5. The FastAPI service provides classification and evaluation endpoints.
+   PostgreSQL stores run and answer results; optional Langfuse observations
+   help trace model and tool calls.
+
 Phase 1 establishes the project foundation for loading speaker answers and
 catalogue facts, validating the assessment CSVs, and serving a minimal health
 endpoint. Phase 2 adds OpenRouter-backed factual claim extraction with source-checked
