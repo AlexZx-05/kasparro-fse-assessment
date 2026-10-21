@@ -39,19 +39,57 @@ When the terminal says `Application startup complete`, open
 <http://127.0.0.1:8000/health> to check that the API is responding. Press
 Ctrl+C in the server terminal to stop it.
 
-To run a development evaluation, use `POST /evaluation-runs` in `/docs` with
-`{"version":"v1","dataset_split":"development"}`. The response gives you a
-numeric `run_id`. Check its progress using that number, not the text
-`NEW_RUN_ID`:
+## Use and check the API
+
+You can use the API in Swagger at <http://127.0.0.1:8000/docs>, or with `curl`
+from a second Git Bash terminal. Keep the Uvicorn terminal open while sending
+requests.
+
+First, check that the service is responding:
 
 ```bash
-RUN_ID=1
-curl "http://127.0.0.1:8000/evaluation-runs/${RUN_ID}"
+curl http://127.0.0.1:8000/health
 ```
 
-Replace `1` with the ID returned by your request. A run is complete when its
-status is `completed`, `partial`, or `failed`. Keep Uvicorn running during the
-evaluation; these background jobs are not resumed after a server restart.
+The expected response is `{"status":"ok"}`. You can also open
+<http://127.0.0.1:8000/docs> in your browser.
+
+To classify an answer, use **POST `/classify`** in Swagger, or send a JSON
+request with the `answer_id`, optional `brand_id`, and `ai_answer`. The answer
+text must exactly match that answer in `data/answers.csv`; otherwise the API
+rejects the request. A successful response contains the extracted claim text,
+its start/end character offsets, a label, and supporting catalogue fact IDs.
+
+To start a V1 development evaluation from Git Bash:
+
+```bash
+curl -X POST http://127.0.0.1:8000/evaluation-runs \
+  -H "Content-Type: application/json" \
+  -d '{"version":"v1","dataset_split":"development"}'
+```
+
+The response contains a numeric `run_id`, for example:
+`{"run_id":4,"version":"v1","dataset_split":"development","status":"running"}`.
+For the verified local run 3, open this URL in a browser:
+
+<http://127.0.0.1:8000/evaluation-runs/3>
+
+For any other run, replace `3` in the URL with the numeric `run_id` returned
+when you started that run. Poll the GET endpoint to see progress and saved
+answer/claim results. `completed` means all answers completed;
+`partial` means evaluation finished but some answers had operational or
+validation errors; `failed` means the run could not finish. Evaluation runs
+execute in the running API process, so do not close or restart Uvicorn until
+the run reaches one of these statuses.
+
+### Example of a verified local run
+
+On 21 October 2026, this project's local API completed V1 development run 3
+with status `partial`: 37 of 40 answers succeeded and 3 failed exact-source
+claim validation. Its measured extraction F1 was 0.9556, joint F1 was 0.9556,
+and answer coverage was 0.925. The actual run summary is saved in
+`reports/v1_development.json`. This is an example from that run, not a promise
+that another run will have the same result.
 
 ## How this project works
 
