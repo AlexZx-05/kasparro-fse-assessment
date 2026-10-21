@@ -1,0 +1,24 @@
+# Environment file
+# .env
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Generated reports
+reports/*
+!reports/.gitkeep
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+~$*.env
